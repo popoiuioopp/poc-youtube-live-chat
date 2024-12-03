@@ -2,7 +2,8 @@ package main
 
 import (
 	"log"
-	"youtube-echo-service/services"
+	"youtube-echo-service/auth"
+	"youtube-echo-service/chat"
 
 	"github.com/labstack/echo/v4"
 )
@@ -10,9 +11,9 @@ import (
 func main() {
 	e := echo.New()
 
-	e.GET("/auth", services.HandleAuth)
-	e.GET("/oauth2callback", services.OAuthCallback)
-	e.GET("/chat", services.ReadChatMessages)
+	e.GET("/auth", auth.HandleAuth)
+	e.GET("/oauth2callback", auth.OAuthCallback)
+	e.GET("/chat", chat.ReadChatMessages)
 
 	// Start server
 	if err := e.Start(":8080"); err != nil {
