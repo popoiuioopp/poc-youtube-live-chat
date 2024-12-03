@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -20,8 +18,9 @@ import (
 )
 
 var (
-	youtubeService *youtube.Service
-	liveChatMap    sync.Map
+	youtubeService  *youtube.Service
+	channelStates   = make(map[string]*ChannelState)
+	channelStatesMu sync.Mutex
 )
 
 type ChatMessage struct {
@@ -31,12 +30,13 @@ type ChatMessage struct {
 	Timestamp   time.Time `json:"timestamp"`
 }
 
-type LiveChat struct {
-	ChatID        string
+type ChannelState struct {
+	IsLive        bool
+	LiveChatID    string
 	Messages      chan *ChatMessage
-	StopChan      chan struct{}
 	Subscribers   map[*websocket.Conn]struct{}
 	SubscribersMu sync.Mutex
+	StopChan      chan struct{}
 }
 
 var upgrader = websocket.Upgrader{
@@ -100,281 +100,6 @@ func HandleAuth(c echo.Context) error {
 	return c.Redirect(http.StatusFound, authURL)
 }
 
-// RegisterStream registers a live stream by channel ID and fetches its chat ID
-func RegisterStream(c echo.Context) error {
-	channelID := c.FormValue("channel_id")
-	if channelID == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing channel_id parameter"})
-	}
-
-	// Fetch the live video ID from the channel ID
-	liveVideoID, err := fetchLiveVideoID(channelID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-	}
-	if liveVideoID == "" {
-		return c.JSON(http.StatusNotFound, map[string]string{"error": "No live video found for this channel"})
-	}
-
-	// Fetch the live chat ID using the live video ID
-	chatID, err := fetchLiveChatIDByVideoID(liveVideoID)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-	}
-
-	liveChat := &LiveChat{
-		ChatID:      chatID,
-		Messages:    make(chan *ChatMessage, 100), // Buffered channel
-		StopChan:    make(chan struct{}),
-		Subscribers: make(map[*websocket.Conn]struct{}),
-	}
-
-	// Start polling messages
-	go pollLiveChatMessages(liveChat)
-
-	// Start broadcasting messages to subscribers
-	go broadcastMessages(liveChat)
-
-	// Store liveChat in the map
-	liveChatMap.Store(chatID, liveChat)
-
-	return c.JSON(http.StatusOK, map[string]string{"chat_id": chatID, "message": "Stream registered successfully"})
-}
-
-func fetchLiveVideoID(channelID string) (string, error) {
-	if youtubeService == nil {
-		return "", fmt.Errorf("YouTube service not initialized")
-	}
-
-	call := youtubeService.Search.List([]string{"id"}).
-		ChannelId(channelID).
-		EventType("live").
-		Type("video").
-		MaxResults(1)
-
-	response, err := call.Do()
-	if err != nil {
-		return "", fmt.Errorf("Error fetching live video ID: %v", err)
-	}
-
-	if len(response.Items) == 0 {
-		return "", nil // No live video found
-	}
-
-	videoID := response.Items[0].Id.VideoId
-	return videoID, nil
-}
-
-func fetchLiveChatIDByVideoID(videoID string) (string, error) {
-	if youtubeService == nil {
-		return "", fmt.Errorf("YouTube service not initialized")
-	}
-
-	// Retrieve the video details
-	call := youtubeService.Videos.List([]string{"liveStreamingDetails"}).Id(videoID)
-	response, err := call.Do()
-	if err != nil {
-		return "", fmt.Errorf("Error retrieving video details: %v", err)
-	}
-
-	if len(response.Items) == 0 {
-		return "", fmt.Errorf("No video found with ID: %s", videoID)
-	}
-
-	liveStreamingDetails := response.Items[0].LiveStreamingDetails
-	if liveStreamingDetails == nil || liveStreamingDetails.ActiveLiveChatId == "" {
-		return "", fmt.Errorf("Live chat not available for this video")
-	}
-
-	return liveStreamingDetails.ActiveLiveChatId, nil
-}
-
-func broadcastMessages(liveChat *LiveChat) {
-	for message := range liveChat.Messages {
-		liveChat.SubscribersMu.Lock()
-		for ws := range liveChat.Subscribers {
-			err := ws.WriteJSON(message)
-			if err != nil {
-				fmt.Printf("Error sending message to subscriber: %v\n", err)
-				ws.Close()
-				delete(liveChat.Subscribers, ws)
-			}
-		}
-		liveChat.SubscribersMu.Unlock()
-	}
-}
-
-func pollLiveChatMessages(liveChat *LiveChat) {
-	defer close(liveChat.Messages)
-	var nextPageToken string
-
-	for {
-		select {
-		case <-liveChat.StopChan:
-			fmt.Printf("Stopping polling for chat ID: %s\n", liveChat.ChatID)
-			return
-		default:
-			call := youtubeService.LiveChatMessages.List(liveChat.ChatID, []string{"snippet", "authorDetails"})
-			if nextPageToken != "" {
-				call = call.PageToken(nextPageToken)
-			}
-			response, err := call.Do()
-			if err != nil {
-				fmt.Printf("Error fetching live chat messages: %v\n", err)
-				time.Sleep(5 * time.Second) // Wait before retrying
-				continue
-			}
-
-			for _, item := range response.Items {
-
-				publishedAt, err := time.Parse(time.RFC3339, item.Snippet.PublishedAt)
-				if err != nil {
-					fmt.Printf("Error parsing time: %v\n", err)
-					// You can choose to skip this message or set a default time
-					publishedAt = time.Now() // Or handle it as per your requirement
-				}
-
-				// Convert item to ChatMessage
-				message := &ChatMessage{
-					MessageID:   item.Id,
-					DisplayName: item.AuthorDetails.DisplayName,
-					Message:     item.Snippet.DisplayMessage,
-					Timestamp:   publishedAt,
-				}
-				liveChat.Messages <- message
-			}
-			nextPageToken = response.NextPageToken
-			time.Sleep(time.Duration(response.PollingIntervalMillis) * time.Millisecond)
-		}
-	}
-}
-
-// ReadChatMessages fetches live chat messages
-func ReadChatMessages(c echo.Context) error {
-	chatID := c.QueryParam("chat_id")
-	if chatID == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing chat_id parameter"})
-	}
-
-	value, ok := liveChatMap.Load(chatID)
-	if !ok {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Chat ID not found"})
-	}
-	liveChat := value.(*LiveChat)
-
-	// Upgrade the HTTP connection to a WebSocket connection
-	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
-	if err != nil {
-		return err
-	}
-	defer ws.Close()
-
-	// Add the WebSocket connection to the subscribers
-	liveChat.SubscribersMu.Lock()
-	liveChat.Subscribers[ws] = struct{}{}
-	liveChat.SubscribersMu.Unlock()
-
-	// Listen for close messages from the client
-	for {
-		_, _, err := ws.ReadMessage()
-		if err != nil {
-			break
-		}
-	}
-
-	// Remove the subscriber when done
-	liveChat.SubscribersMu.Lock()
-	delete(liveChat.Subscribers, ws)
-	liveChat.SubscribersMu.Unlock()
-
-	return nil
-}
-
-func UnregisterStream(c echo.Context) error {
-	chatID := c.FormValue("chat_id")
-
-	value, ok := liveChatMap.Load(chatID)
-	if !ok {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Chat ID not found"})
-	}
-
-	liveChat := value.(*LiveChat)
-	close(liveChat.StopChan)
-	liveChatMap.Delete(chatID)
-
-	return c.JSON(http.StatusOK, map[string]string{"message": "Stream unregistered successfully"})
-}
-
-// fetchLiveChatID retrieves the chat ID of a live stream
-func fetchLiveChatID(streamURL string) (string, error) {
-	if youtubeService == nil {
-		return "", fmt.Errorf("YouTube service not initialized")
-	}
-
-	// Extract the video ID from the URL
-	videoID, err := extractVideoID(streamURL)
-	if err != nil {
-		return "", fmt.Errorf("Failed to extract video ID: %v", err)
-	}
-
-	// Retrieve the video details
-	call := youtubeService.Videos.List([]string{"liveStreamingDetails"}).Id(videoID)
-	response, err := call.Do()
-	if err != nil {
-		return "", fmt.Errorf("Error retrieving video details: %v", err)
-	}
-
-	if len(response.Items) == 0 {
-		return "", fmt.Errorf("No video found with ID: %s", videoID)
-	}
-
-	liveStreamingDetails := response.Items[0].LiveStreamingDetails
-	if liveStreamingDetails == nil || liveStreamingDetails.ActiveLiveChatId == "" {
-		return "", fmt.Errorf("Live chat not available for this video")
-	}
-
-	return liveStreamingDetails.ActiveLiveChatId, nil
-}
-
-func extractVideoID(urlStr string) (string, error) {
-	parsedURL, err := url.Parse(urlStr)
-	if err != nil {
-		return "", err
-	}
-
-	queryParams := parsedURL.Query()
-	if v, ok := queryParams["v"]; ok && len(v) > 0 {
-		return v[0], nil
-	}
-
-	// Handle short URLs like youtu.be/<videoID>
-	if parsedURL.Host == "youtu.be" {
-		return strings.TrimLeft(parsedURL.Path, "/"), nil
-	}
-
-	return "", fmt.Errorf("Could not extract video ID from URL")
-}
-
-// fetchLiveChatMessages retrieves live chat messages from a chat ID
-func fetchLiveChatMessages(chatID string) ([]string, error) {
-	if youtubeService == nil {
-		return nil, fmt.Errorf("YouTube service not initialized")
-	}
-
-	call := youtubeService.LiveChatMessages.List(chatID, []string{"snippet", "authorDetails"})
-	response, err := call.Do()
-	if err != nil {
-		return nil, fmt.Errorf("Error fetching live chat messages: %v", err)
-	}
-
-	messages := []string{}
-	for _, item := range response.Items {
-		messages = append(messages, item.Snippet.DisplayMessage)
-	}
-
-	return messages, nil
-}
-
 func OAuthCallback(c echo.Context) error {
 	// Read the client secrets
 	b, err := ioutil.ReadFile("client_secret.json")
@@ -409,4 +134,232 @@ func OAuthCallback(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "Authorization successful"})
+}
+
+// ReadChatMessages serves as a WebSocket endpoint to stream messages based on channel ID
+func ReadChatMessages(c echo.Context) error {
+	channelID := c.QueryParam("channel_id")
+	if channelID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing channel_id parameter"})
+	}
+
+	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+
+	// Add the subscriber
+	addSubscriber(channelID, ws)
+
+	// Keep the connection open until the client disconnects
+	for {
+		_, _, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
+	}
+
+	// Remove the subscriber when done
+	removeSubscriber(channelID, ws)
+
+	return nil
+}
+
+func startChannelMonitoring(channelID string) {
+	if _, exists := channelStates[channelID]; exists {
+		channelStatesMu.Unlock()
+		return
+	}
+
+	state := &ChannelState{
+		IsLive:      false,
+		LiveChatID:  "",
+		Messages:    make(chan *ChatMessage, 100),
+		Subscribers: make(map[*websocket.Conn]struct{}),
+		StopChan:    make(chan struct{}),
+	}
+	channelStates[channelID] = state
+
+	go monitorChannel(channelID, state)
+	go broadcastMessages(channelID, state)
+	fmt.Println("START MONITORING CHANNELID:", channelID)
+}
+
+func monitorChannel(channelID string, state *ChannelState) {
+	for {
+		select {
+		case <-state.StopChan:
+			fmt.Printf("Stopping monitoring for channel ID: %s\n", channelID)
+			return
+		default:
+			liveVideoID, err := fetchLiveVideoID(channelID)
+			if err != nil {
+				fmt.Printf("Error fetching live video ID: %v\n", err)
+				time.Sleep(30 * time.Second)
+				continue
+			}
+
+			if liveVideoID != "" {
+				if !state.IsLive {
+					state.IsLive = true
+					liveChatID, err := fetchLiveChatIDByVideoID(liveVideoID)
+					if err != nil {
+						fmt.Printf("Error fetching live chat ID: %v\n", err)
+						time.Sleep(30 * time.Second)
+						continue
+					}
+					state.LiveChatID = liveChatID
+					go pollLiveChatMessages(channelID, state)
+				}
+			} else {
+				if state.IsLive {
+					state.IsLive = false
+					state.StopChan <- struct{}{} // Stop polling live chat messages
+					close(state.Messages)
+					state.Messages = make(chan *ChatMessage, 100)
+				}
+			}
+
+			time.Sleep(30 * time.Second)
+		}
+	}
+}
+
+func pollLiveChatMessages(channelID string, state *ChannelState) {
+	fmt.Printf("Starting to poll live chat messages for channel ID: %s\n", channelID)
+	var nextPageToken string
+
+	for {
+		select {
+		case <-state.StopChan:
+			fmt.Printf("Stopping live chat polling for channel ID: %s\n", channelID)
+			return
+		default:
+			call := youtubeService.LiveChatMessages.List(state.LiveChatID, []string{"snippet", "authorDetails"})
+			if nextPageToken != "" {
+				call = call.PageToken(nextPageToken)
+			}
+			response, err := call.Do()
+			if err != nil {
+				fmt.Printf("Error fetching live chat messages: %v\n", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			for _, item := range response.Items {
+				publishedAt, err := time.Parse(time.RFC3339, item.Snippet.PublishedAt)
+				if err != nil {
+					fmt.Printf("Error parsing time: %v\n", err)
+					publishedAt = time.Now()
+				}
+
+				message := &ChatMessage{
+					MessageID:   item.Id,
+					DisplayName: item.AuthorDetails.DisplayName,
+					Message:     item.Snippet.DisplayMessage,
+					Timestamp:   publishedAt,
+				}
+				state.Messages <- message
+			}
+			nextPageToken = response.NextPageToken
+			time.Sleep(time.Duration(response.PollingIntervalMillis) * time.Millisecond)
+		}
+	}
+}
+
+func broadcastMessages(channelID string, state *ChannelState) {
+	for message := range state.Messages {
+		state.SubscribersMu.Lock()
+		for ws := range state.Subscribers {
+			err := ws.WriteJSON(message)
+			if err != nil {
+				fmt.Printf("Error sending message to subscriber: %v\n", err)
+				ws.Close()
+				delete(state.Subscribers, ws)
+			}
+		}
+		state.SubscribersMu.Unlock()
+	}
+}
+
+func addSubscriber(channelID string, ws *websocket.Conn) {
+	channelStatesMu.Lock()
+	state, exists := channelStates[channelID]
+	if !exists {
+		startChannelMonitoring(channelID)
+		state = channelStates[channelID]
+	}
+	channelStatesMu.Unlock()
+
+	state.SubscribersMu.Lock()
+	state.Subscribers[ws] = struct{}{}
+	state.SubscribersMu.Unlock()
+}
+
+func removeSubscriber(channelID string, ws *websocket.Conn) {
+	channelStatesMu.Lock()
+	state, exists := channelStates[channelID]
+	if exists {
+		state.SubscribersMu.Lock()
+		delete(state.Subscribers, ws)
+		subscribersLeft := len(state.Subscribers)
+		state.SubscribersMu.Unlock()
+
+		if subscribersLeft == 0 {
+			close(state.StopChan)
+			delete(channelStates, channelID)
+		}
+	}
+	channelStatesMu.Unlock()
+}
+
+// fetchLiveVideoID fetches the live video ID from a given channel ID
+func fetchLiveVideoID(channelID string) (string, error) {
+	if youtubeService == nil {
+		return "", fmt.Errorf("YouTube service not initialized")
+	}
+
+	call := youtubeService.Search.List([]string{"id"}).
+		ChannelId(channelID).
+		EventType("live").
+		Type("video").
+		MaxResults(1)
+
+	response, err := call.Do()
+	if err != nil {
+		return "", fmt.Errorf("Error fetching live video ID: %v", err)
+	}
+
+	if len(response.Items) == 0 {
+		return "", nil // No live video found
+	}
+
+	videoID := response.Items[0].Id.VideoId
+	fmt.Printf("FOUND live stream for %s : %s", channelID, videoID)
+	return videoID, nil
+}
+
+// fetchLiveChatIDByVideoID retrieves the chat ID of a live stream given a video ID
+func fetchLiveChatIDByVideoID(videoID string) (string, error) {
+	if youtubeService == nil {
+		return "", fmt.Errorf("YouTube service not initialized")
+	}
+
+	call := youtubeService.Videos.List([]string{"liveStreamingDetails"}).Id(videoID)
+	response, err := call.Do()
+	if err != nil {
+		return "", fmt.Errorf("Error retrieving video details: %v", err)
+	}
+
+	if len(response.Items) == 0 {
+		return "", fmt.Errorf("No video found with ID: %s", videoID)
+	}
+
+	liveStreamingDetails := response.Items[0].LiveStreamingDetails
+	if liveStreamingDetails == nil || liveStreamingDetails.ActiveLiveChatId == "" {
+		return "", fmt.Errorf("Live chat not available for this video")
+	}
+
+	return liveStreamingDetails.ActiveLiveChatId, nil
 }

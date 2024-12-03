@@ -10,10 +10,9 @@ import (
 func main() {
 	e := echo.New()
 
-	e.GET("/auth", services.HandleAuth)          // Authentication endpoint
-	e.POST("/register", services.RegisterStream) // Register a live stream
-	e.GET("/chat", services.ReadChatMessages)    // Get live chat messages
+	e.GET("/auth", services.HandleAuth)
 	e.GET("/oauth2callback", services.OAuthCallback)
+	e.GET("/chat", services.ReadChatMessages)
 
 	// Start server
 	if err := e.Start(":8080"); err != nil {
