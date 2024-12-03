@@ -100,10 +100,24 @@ func HandleAuth(c echo.Context) error {
 	return c.Redirect(http.StatusFound, authURL)
 }
 
-// RegisterStream registers a live stream and fetches its chat ID
+// RegisterStream registers a live stream by channel ID and fetches its chat ID
 func RegisterStream(c echo.Context) error {
-	streamURL := c.FormValue("url")
-	chatID, err := fetchLiveChatID(streamURL)
+	channelID := c.FormValue("channel_id")
+	if channelID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing channel_id parameter"})
+	}
+
+	// Fetch the live video ID from the channel ID
+	liveVideoID, err := fetchLiveVideoID(channelID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	if liveVideoID == "" {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "No live video found for this channel"})
+	}
+
+	// Fetch the live chat ID using the live video ID
+	chatID, err := fetchLiveChatIDByVideoID(liveVideoID)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
@@ -125,6 +139,54 @@ func RegisterStream(c echo.Context) error {
 	liveChatMap.Store(chatID, liveChat)
 
 	return c.JSON(http.StatusOK, map[string]string{"chat_id": chatID, "message": "Stream registered successfully"})
+}
+
+func fetchLiveVideoID(channelID string) (string, error) {
+	if youtubeService == nil {
+		return "", fmt.Errorf("YouTube service not initialized")
+	}
+
+	call := youtubeService.Search.List([]string{"id"}).
+		ChannelId(channelID).
+		EventType("live").
+		Type("video").
+		MaxResults(1)
+
+	response, err := call.Do()
+	if err != nil {
+		return "", fmt.Errorf("Error fetching live video ID: %v", err)
+	}
+
+	if len(response.Items) == 0 {
+		return "", nil // No live video found
+	}
+
+	videoID := response.Items[0].Id.VideoId
+	return videoID, nil
+}
+
+func fetchLiveChatIDByVideoID(videoID string) (string, error) {
+	if youtubeService == nil {
+		return "", fmt.Errorf("YouTube service not initialized")
+	}
+
+	// Retrieve the video details
+	call := youtubeService.Videos.List([]string{"liveStreamingDetails"}).Id(videoID)
+	response, err := call.Do()
+	if err != nil {
+		return "", fmt.Errorf("Error retrieving video details: %v", err)
+	}
+
+	if len(response.Items) == 0 {
+		return "", fmt.Errorf("No video found with ID: %s", videoID)
+	}
+
+	liveStreamingDetails := response.Items[0].LiveStreamingDetails
+	if liveStreamingDetails == nil || liveStreamingDetails.ActiveLiveChatId == "" {
+		return "", fmt.Errorf("Live chat not available for this video")
+	}
+
+	return liveStreamingDetails.ActiveLiveChatId, nil
 }
 
 func broadcastMessages(liveChat *LiveChat) {
