@@ -42,7 +42,7 @@ func MonitorChannel(channelID string, state *models.ChannelState) {
 				}
 			}
 
-			time.Sleep(30 * time.Second)
+			time.Sleep(600 * time.Second)
 		}
 	}
 }
