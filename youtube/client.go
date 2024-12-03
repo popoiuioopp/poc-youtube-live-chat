@@ -3,7 +3,7 @@ package youtube
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -18,7 +18,7 @@ func InitYouTubeClient(token *oauth2.Token) error {
 	ctx := context.Background()
 
 	// Read client secrets
-	b, err := ioutil.ReadFile("client_secret.json")
+	b, err := os.ReadFile("client_secret.json")
 	if err != nil {
 		return fmt.Errorf("unable to read client secret file: %v", err)
 	}

@@ -2,8 +2,8 @@ package auth
 
 import (
 	"context"
-	"io/ioutil"
 	"net/http"
+	"os"
 
 	"github.com/labstack/echo/v4"
 	"golang.org/x/oauth2"
@@ -16,7 +16,7 @@ import (
 // HandleAuth initializes OAuth flow
 func HandleAuth(c echo.Context) error {
 	// Read the client secrets
-	b, err := ioutil.ReadFile("client_secret.json")
+	b, err := os.ReadFile("client_secret.json")
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Unable to read client secret file"})
 	}
@@ -39,7 +39,7 @@ func HandleAuth(c echo.Context) error {
 
 func OAuthCallback(c echo.Context) error {
 	// Read the client secrets
-	b, err := ioutil.ReadFile("client_secret.json")
+	b, err := os.ReadFile("client_secret.json")
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Unable to read client secret file"})
 	}
