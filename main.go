@@ -14,21 +14,23 @@ import (
 func main() {
 	e := echo.New()
 
-	e.GET("/auth", auth.HandleAuth)
-	e.GET("/oauth2callback", auth.OAuthCallback)
+	authService, err := auth.NewAuthService("client_secret.json", "token/youtubeToken.json", "http://localhost:8080/oauth2callback")
+	if err != nil {
+		log.Fatalf("Failed to create AuthService: %v", err)
+	}
+
+	e.GET("/auth", authService.HandleAuth)
+	e.GET("/oauth2callback", authService.OAuthCallback)
 	e.GET("/chat", chat.ReadChatMessages)
 
-	cfg, err := auth.GetOAuthConfig()
+	token, err := yt.LoadTokenFromFile(authService.TokenFilePath())
 	if err == nil {
-		token, err := yt.LoadTokenFromFile(auth.TokenFilePath)
-		if err == nil {
-			// Token file exists, let's try to init
-			err := yt.InitYoutubeClient(cfg, token, auth.TokenFilePath)
-			if err != nil {
-				fmt.Println("WARNING: token from file was invalid or something:", err)
-			} else {
-				fmt.Println("Successfully loaded existing token, no /auth route needed.")
-			}
+		cfg := authService.GetConfig()
+		err := yt.InitYoutubeClient(cfg, token, authService.TokenFilePath())
+		if err != nil {
+			fmt.Println("WARNING: token from file was invalid or something:", err)
+		} else {
+			fmt.Println("Successfully loaded existing token, no /auth route needed.")
 		}
 	}
 

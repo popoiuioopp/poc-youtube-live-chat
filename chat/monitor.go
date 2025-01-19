@@ -17,7 +17,7 @@ func MonitorChannel(channelID string, state *models.ChannelState) {
 			liveVideoID, err := yt.FetchLiveVideoID(channelID)
 			if err != nil {
 				fmt.Printf("Error fetching live video ID: %v\n", err)
-				time.Sleep(30 * time.Second)
+				time.Sleep(600 * time.Second)
 				continue
 			}
 
@@ -27,7 +27,7 @@ func MonitorChannel(channelID string, state *models.ChannelState) {
 					liveChatID, err := yt.FetchLiveChatIDByVideoID(liveVideoID)
 					if err != nil {
 						fmt.Printf("Error fetching live chat ID: %v\n", err)
-						time.Sleep(30 * time.Second)
+						time.Sleep(600 * time.Second)
 						continue
 					}
 					state.LiveChatID = liveChatID
@@ -64,7 +64,7 @@ func PollLiveChatMessages(channelID string, state *models.ChannelState) {
 			response, err := call.Do()
 			if err != nil {
 				fmt.Printf("Error fetching live chat messages: %v\n", err)
-				time.Sleep(5 * time.Second)
+				time.Sleep(1 * time.Minute)
 				continue
 			}
 
