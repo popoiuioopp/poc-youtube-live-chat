@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 
@@ -13,22 +14,14 @@ import (
 	yt "youtube-echo-service/youtube"
 )
 
+var TokenFilePath = "token/youtubeToken.json"
+
 // HandleAuth initializes OAuth flow
 func HandleAuth(c echo.Context) error {
-	// Read the client secrets
-	b, err := os.ReadFile("client_secret.json")
+	config, err := GetOAuthConfig()
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Unable to read client secret file"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot get oauth config"})
 	}
-
-	// Set up OAuth2 configuration
-	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Unable to parse client secret file"})
-	}
-
-	// Set redirect URI to handle the authorization code
-	config.RedirectURL = "http://localhost:8080/oauth2callback"
 
 	// Generate the OAuth2 URL
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
@@ -38,20 +31,10 @@ func HandleAuth(c echo.Context) error {
 }
 
 func OAuthCallback(c echo.Context) error {
-	// Read the client secrets
-	b, err := os.ReadFile("client_secret.json")
+	config, err := GetOAuthConfig()
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Unable to read client secret file"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot get oauth config"})
 	}
-
-	// Set up OAuth2 configuration
-	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Unable to parse client secret file"})
-	}
-
-	// Ensure the redirect URL matches
-	config.RedirectURL = "http://localhost:8080/oauth2callback"
 
 	// Retrieve the authorization code from the query parameter
 	code := c.QueryParam("code")
@@ -65,10 +48,33 @@ func OAuthCallback(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to exchange token"})
 	}
 
+	if err := yt.SaveTokenToFile(token, TokenFilePath); err != nil {
+		fmt.Println("WARNING: failed to save token to file:", err)
+	}
+
 	// Initialize YouTube client with the new token
-	if err := yt.InitYouTubeClient(token); err != nil {
+	if err := yt.InitYoutubeClient(config, token, TokenFilePath); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "Authorization successful"})
+}
+
+func GetOAuthConfig() (*oauth2.Config, error) {
+	// Read the client secrets
+	b, err := os.ReadFile("client_secret.json")
+	if err != nil {
+		return nil, fmt.Errorf("unable to read client secret file: %v", err)
+	}
+
+	// Set up OAuth2 configuration
+	config, err := google.ConfigFromJSON(b, youtube.YoutubeScope)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse client secret file: %v", err)
+	}
+
+	// Set redirect URI to handle the authorization code
+	config.RedirectURL = "http://localhost:8080/oauth2callback"
+
+	return config, nil
 }
